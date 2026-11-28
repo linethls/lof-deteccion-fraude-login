@@ -1,4 +1,5 @@
-import numpy as np, joblib
+import joblib
+import numpy as np
 import streamlit as st
 from pathlib import Path
 
@@ -8,29 +9,37 @@ PROC = RAIZ / "datos" / "procesado"
 
 st.set_page_config(page_title="Detector de logins sospechosos", page_icon="🔐")
 st.title("🔐 Detector de inicios de sesión sospechosos")
-st.caption("Modelo: Local Outlier Factor (LOF), no supervisado")
+st.caption("Modelo: Local Outlier Factor (LOF, k=50, 6 variables ponderadas x3, ajustado con accesos normales)")
 
-# ---- Comprobar que existen el modelo y el escalador ----
-if not (MODELOS / "scaler.joblib").exists():
-    st.error("No encuentro el modelo. Ejecuta primero preparar.py y entrenar_lof.py.")
+# ---- Comprobar que existen el modelo, el escalador y los puntajes de validación ----
+modelo_path = MODELOS / "lof_mejorado_k50.joblib"
+scaler_path = MODELOS / "scaler.joblib"
+scores_val_path = PROC / "scores_val_lof_mejorado_k50.npy"
+
+if not (modelo_path.exists() and scaler_path.exists() and scores_val_path.exists()):
+    st.error("No encuentro los archivos del modelo mejorado. Ejecuta primero preparar.py y evaluar_final.py.")
     st.stop()
 
-ks = sorted(int(p.stem.split("_k")[1]) for p in MODELOS.glob("lof_k*.joblib"))
-k = st.sidebar.selectbox("Número de vecinos (k)", ks, index=ks.index(20) if 20 in ks else 0)
-pct = st.sidebar.selectbox("Marcar como sospechoso el % más alto", [0.5, 1, 2, 5], index=1)
+pct = st.sidebar.selectbox(
+    "Marcar como sospechoso el % más alto (en validación)",
+    [0.5, 1, 2, 5],
+    index=3,  # por defecto 5 %, igual que en la Tabla 2 del informe
+)
 
-scaler = joblib.load(MODELOS / "scaler.joblib")
-lof = joblib.load(MODELOS / f"lof_k{k}.joblib")
+scaler = joblib.load(scaler_path)
+lof = joblib.load(modelo_path)
+umbral = float(np.percentile(np.load(scores_val_path), 100 - pct))
 
-# Umbral: percentil de los puntajes de prueba que dejó el entrenamiento
-umbral = np.percentile(np.load(PROC / f"scores_k{k}.npy"), 100 - pct)
+# Índices de las 6 variables en scaler (excluye login_ok [2] y seg_desde_ultimo [7])
+IDX_6 = [0, 1, 3, 4, 5, 6]
+PESOS_6 = np.array([1.0, 1.0, 3.0, 3.0, 3.0, 3.0])
 
 # ---- Casos de prueba para la demostración ----
 CASOS = {
-    "Login normal": dict(hora=14, ok=1, pais=0, asn=0, ip=0, disp=0, horas=24.0),
-    "3 a. m. desde un país nuevo": dict(hora=3, ok=1, pais=1, asn=1, ip=1, disp=0, horas=300.0),
-    "Todo nuevo y fallido": dict(hora=4, ok=0, pais=1, asn=1, ip=1, disp=1, horas=2.0),
-    "Personalizado": dict(hora=12, ok=1, pais=0, asn=0, ip=0, disp=0, horas=24.0),
+    "Login normal": dict(hora=14, pais=0, asn=0, ip=0, disp=0),
+    "3 a. m. desde un país nuevo": dict(hora=3, pais=1, asn=1, ip=1, disp=0),
+    "Todo nuevo de madrugada": dict(hora=4, pais=1, asn=1, ip=1, disp=1),
+    "Personalizado": dict(hora=12, pais=0, asn=0, ip=0, disp=0),
 }
 caso = st.selectbox("Caso de prueba", list(CASOS))
 c = CASOS[caso]
@@ -38,26 +47,37 @@ c = CASOS[caso]
 col1, col2 = st.columns(2)
 with col1:
     hora = st.slider("Hora del acceso", 0, 23, c["hora"], key=f"{caso}_hora")
-    horas = st.number_input("Horas desde el último login", 0.0, 10000.0,
-                            c["horas"], key=f"{caso}_horas")
-    ok = st.checkbox("Login exitoso", bool(c["ok"]), key=f"{caso}_ok")
-with col2:
     pais = st.checkbox("País nuevo para este usuario", bool(c["pais"]), key=f"{caso}_pais")
     asn = st.checkbox("Red (ASN) nueva", bool(c["asn"]), key=f"{caso}_asn")
+with col2:
     ip = st.checkbox("IP nueva", bool(c["ip"]), key=f"{caso}_ip")
     disp = st.checkbox("Dispositivo nuevo", bool(c["disp"]), key=f"{caso}_disp")
 
 if st.button("Evaluar login", type="primary"):
-    # El orden debe ser el mismo que FEATS en variables.py
-    x = np.array([[np.sin(2 * np.pi * hora / 24), np.cos(2 * np.pi * hora / 24),
-                   int(ok), int(pais), int(asn), int(ip), int(disp),
-                   np.log1p(horas * 3600)]])
-    puntaje = float(-lof.score_samples(scaler.transform(x))[0])
+    # Mismo orden que sin_cont en evaluar_final.py:
+    # ["hora_sin", "hora_cos", "pais_nuevo", "asn_nuevo", "ip_nueva", "dispositivo_nuevo"]
+    x_raw = np.array([[
+        np.sin(2 * np.pi * hora / 24),
+        np.cos(2 * np.pi * hora / 24),
+        int(pais),
+        int(asn),
+        int(ip),
+        int(disp),
+    ]])
 
-    if puntaje > umbral:
-        st.error("⚠️ SOSPECHOSO: conviene revisar este acceso")
+    # Estandarizar con el scaler de entrenamiento y DESPUÉS aplicar los pesos x3
+    x_std = (x_raw - scaler.mean_[IDX_6]) / scaler.scale_[IDX_6]
+    x_final = x_std * PESOS_6
+
+    puntaje = float(-lof.score_samples(x_final)[0])
+
+    if puntaje >= umbral:
+        st.error("⚠️ SOSPECHOSO: conviene pedir verificación adicional (MFA)")
     else:
-        st.success("✅ NORMAL")
+        st.success("✅ NORMAL: acceso habitual")
+
     st.metric("Puntaje LOF", f"{puntaje:.2f}", f"umbral {umbral:.2f}", delta_color="off")
-    st.caption("Cerca de 1 es normal. Mientras más alto, más aislado está el acceso "
-               "de los accesos parecidos.")
+    st.caption(
+        "Cerca de 1 es normal. Mientras más alto, más aislado está el acceso "
+        "respecto al vecindario de accesos normales."
+    )

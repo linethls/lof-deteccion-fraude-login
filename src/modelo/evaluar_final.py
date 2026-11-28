@@ -1,5 +1,7 @@
 import sys
-import numpy as np, pandas as pd
+import joblib
+import numpy as np
+import pandas as pd
 from pathlib import Path
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.metrics import average_precision_score, roc_auc_score
@@ -10,9 +12,9 @@ from formato import titulo, seccion, nota, tabla, miles
 
 PROC = RAIZ / "datos" / "procesado"
 RES = RAIZ / "resultados"
+MODELOS = RAIZ / "modelos"
 RES.mkdir(parents=True, exist_ok=True)
-
-
+MODELOS.mkdir(parents=True, exist_ok=True)
 
 df = pd.read_csv(PROC / "features.csv")
 FEATS = [c for c in df.columns if c not in ("y", "usuario", "fecha")]
@@ -34,18 +36,25 @@ pesos = np.array([3.0 if FEATS[i].endswith(("_nuevo", "_nueva")) else 1.0
                   for i in sin_cont])
 
 
-def lof_scores(cols, k, pesos=None):
+def lof_scores(cols, k, pesos=None, guardar_como=None):
     A, V, T = X_tr[:, cols], X_va[:, cols], X_te[:, cols]
     if pesos is not None:
         A, V, T = A * pesos, V * pesos, T * pesos
     lof = LocalOutlierFactor(n_neighbors=k, novelty=True, n_jobs=-1).fit(A[y_tr == 0])
-    return -lof.score_samples(V), -lof.score_samples(T)
+    s_va = -lof.score_samples(V)
+    s_te = -lof.score_samples(T)
+    if guardar_como:
+        joblib.dump(lof, MODELOS / f"{guardar_como}.joblib")
+        np.save(PROC / f"scores_val_{guardar_como}.npy", s_va)
+    return s_va, s_te
 
 
 candidatos = {
     "Línea base (suma novedades)": (X_va[:, nov].sum(axis=1), X_te[:, nov].sum(axis=1)),
     "LOF todas las variables (k=20)": lof_scores(list(range(len(FEATS))), 20),
-    "LOF sin seg/login_ok, x3 (k=50)": lof_scores(sin_cont, 50, pesos),
+    "LOF sin seg/login_ok, x3 (k=50)": lof_scores(
+        sin_cont, 50, pesos, guardar_como="lof_mejorado_k50"
+    ),
 }
 
 print("\nCalculando intervalos de confianza (1000 remuestreos por método)...")
@@ -110,11 +119,11 @@ conclusion = (
     f"Los intervalos de AP de '{a}' y '{b}' se solapan: con {int(y_te.sum())} "
     "ataques no se puede declarar un método ganador."
     if solapan else
-    f"Los intervalos de AP de '{a}' y '{b}' no se solapan: la diferencia es consistente.")
-
-
+    f"Los intervalos de AP de '{a}' y '{b}' no se solapan: la diferencia es consistente."
+)
+print(f"\nConclusión estadística: {conclusion}")
 
 for i, (n, (sv, st)) in enumerate(candidatos.items()):
     np.save(PROC / f"final_test_{i}.npy", st)
 np.save(PROC / "final_test_y.npy", y_te)
-print(f"Archivos guardados: resultados/resultados_finales_test.csv y puntajes para los gráficos")
+print("Archivos guardados: resultados/resultados_finales_test.csv, modelo mejorado y puntajes.")
